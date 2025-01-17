@@ -1,0 +1,461 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Table of Reagents Generator</title>
+  <style>
+    body {
+      font-family: sans-serif;
+      margin: 0;
+      padding: 0;
+      text-align: center;
+    }
+
+    #compoundForm {
+      margin: 1em auto;         
+      display: inline-block;    
+      text-align: center;         
+      padding: 0em;
+    }
+
+    label {
+      display: block;
+      margin-top: 0.0em;
+    }
+    textarea {
+      width: 300px;
+      height: 80px;
+    }
+    button {
+      margin-top: 0.5em;
+      padding: 0.4em 0.8em;
+      cursor: pointer;
+    }
+    .error {
+      color: red;
+      margin-top: 0.5em;
+    }
+
+
+    table {
+      border-collapse: collapse;
+      margin: 1em auto; 
+      width: 90%;       
+      max-width: 950px;
+      text-align: left; 
+    }
+    th, td {
+      border: 1px solid #ccc;
+      padding: 0.5em;
+      vertical-align: top;
+      white-space: pre-wrap; 
+    }
+    th {
+      background-color: #f0f0f0;
+      text-align: center; 
+    }
+
+    .export-buttons {
+      margin-top: 1em;
+    }
+    .export-buttons button {
+      margin-right: 0.5em;
+    }
+  </style>
+</head>
+<body>
+<br />
+<h2>Table of Reagents Generator</h2>
+<p>This table of reagents generator takes chemical names and 
+outputs a table of reagents<br> containing CID, molar mass, melting point, boiling point,
+density, and hazards (GHS).<br> Note that the hazards may include more hazards than displayed on PubChem as it pulls from <br>
+the full section of hazards which includes multiple sources (e.g. <a href="https://pubchem.ncbi.nlm.nih.gov/compound/Acetone#section=GHS-Classification&fullscreen=true">here</a> for acetone).
+<br><br> You have the choice to download your data as a .csv or a Word document after it is generated.
+</p>
+<form id="compoundForm">
+  <label for="compoundInput">
+    Enter a compound name, or multiple (comma or newline separated):
+  </label>
+  <br />
+  <textarea id="compoundInput"></textarea>
+  <br />
+  <button type="submit">Make Table</button>
+</form>
+
+<div class="export-buttons" style="display:none;">
+  <button id="downloadCsvBtn">Download CSV</button>
+  <button id="downloadDocBtn">Download Word</button>
+</div>
+
+<div id="errorMessage" class="error" style="display:none;"></div>
+<div id="results"></div>
+
+<p style="font-size: 10px;"> atlashrike │ TC 2025 </p>
+
+<script>
+
+  const form = document.getElementById("compoundForm");
+  const compoundInput = document.getElementById("compoundInput");
+  const resultsDiv = document.getElementById("results");
+  const errorDiv = document.getElementById("errorMessage");
+  const exportButtonsDiv = document.querySelector(".export-buttons");
+
+  const downloadCsvBtn = document.getElementById("downloadCsvBtn");
+  const downloadDocBtn = document.getElementById("downloadDocBtn");
+
+/* submission details */
+
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    errorDiv.style.display = "none";
+    errorDiv.textContent = "";
+    resultsDiv.innerHTML = "";
+    exportButtonsDiv.style.display = "none";
+
+    const rawText = compoundInput.value.trim();
+    if (!rawText) return;
+
+    const compoundNames = rawText
+      .split(/[\n,]+/)
+      .map(n => n.trim())
+      .filter(n => n.length > 0);
+
+    if (compoundNames.length === 0) return;
+
+    const allData = [];
+
+    for (let name of compoundNames) {
+      try {
+        const cid = await getCID(name);
+        if (!cid) {
+          allData.push({
+            compoundName: name,
+            cid: "Not Found",
+            mw: "N/A",
+            meltingPoint: "N/A",
+            boilingPoint: "N/A",
+            density: "N/A",
+            ghs: "N/A"
+          });
+        } else {
+          const sdsData = await getSdsData(cid);
+          const mw = await getMolecularWeight(cid);
+          const mpStr = bulletify(sdsData.meltingPoints);
+          const bpStr = bulletify(sdsData.boilingPoints);
+          const densStr = bulletify(sdsData.densities);
+          const { hazards, precautions } = formatGhs(sdsData.ghs);
+          const finalGhs = [hazards, precautions].filter(x => x).join("\n\n") || "N/A";
+
+          allData.push({
+            compoundName: name,
+            cid: cid.toString(),
+            mw: mw || "N/A",
+            meltingPoint: mpStr,
+            boilingPoint: bpStr,
+            density: densStr,
+            ghs: finalGhs
+          });
+        }
+      } catch (err) {
+        allData.push({
+          compoundName: name,
+          cid: "Error",
+          mw: "N/A",
+          meltingPoint: "N/A",
+          boilingPoint: "N/A",
+          density: "N/A",
+          ghs: err.message || "Unknown error"
+        });
+      }
+    }
+
+    renderResultsTable(allData);
+
+    if (allData.length > 0) {
+      exportButtonsDiv.style.display = "block";
+    }
+  });
+
+/* bullet points */
+
+  function bulletify(arr) {
+    if (!arr || arr.length === 0) return "N/A";
+    return arr.map(item => `• ${item}`).join("\n");
+  }
+
+/*parse ghs text */
+
+  function formatGhs(rawGhs) {
+  if (!rawGhs) return { hazards: "", precautions: "" };
+  const frags = rawGhs.split("|").map(x => x.trim()).filter(x => x);
+  const hazardMap = new Map();
+  const precautionSet = new Set();
+
+/* the hazards get fetched multiple times if regex is not used */
+/* and it looks really bad not to mention confusing */
+/* pulls from pubchem's full ghs classification page*/
+/* so duplicates happen because of multiple listed sources */
+/* for safety data */
+
+  const HAZARD_REGEX = /\b(H\d{3})([^|]*?)(?=\bH\d{3}\b|$)/gs;
+  const PRECAUTION_REGEX = /\bP\d{3}\b/g;
+
+  for (let frag of frags) {
+    const hazardMatches = [...frag.matchAll(HAZARD_REGEX)];
+    for (let match of hazardMatches) {
+      let code = match[1].trim();    
+      let remainder = match[2].trim(); 
+      remainder = remainder.replace(/\(\s*>\s*\d+(\.\d+)?%\s*\)/g, "").trim();
+
+      let statement;
+      if (remainder.startsWith(":")) {
+        remainder = remainder.replace(/^:\s*/, "");
+        statement = `${code}: ${remainder}`;
+      } else if (remainder) {
+        if (!remainder.startsWith("(") && !remainder.startsWith("[")) {
+          statement = `${code}: ${remainder}`;
+        } else {
+          statement = `${code} ${remainder}`;
+        }
+      } else {
+        statement = code;
+      }
+
+      if (!hazardMap.has(code)) {
+        hazardMap.set(code, statement);
+      }
+    }
+
+    const pMatches = frag.match(PRECAUTION_REGEX);
+    if (pMatches) {
+      for (let p of pMatches) {
+        precautionSet.add(p.trim());
+      }
+    }
+  }
+
+  const sortedCodes = [...hazardMap.keys()].sort(); 
+  const hazardLines = sortedCodes.map(code => {
+    return `• ${hazardMap.get(code)}`;
+  });
+  const hazardsText = hazardLines.join("\n");
+
+  const precautionsArray = [...precautionSet];
+  let precautionsText = "";
+  if (precautionsArray.length > 0) {
+    precautionsText = "Precautionary codes: " + precautionsArray.join(", ");
+  }
+
+  return { hazards: hazardsText, precautions: precautionsText };
+}
+
+/* getInfos */
+
+  async function getCID(name) {
+    const url = `https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/name/${encodeURIComponent(name)}/cids/JSON`;
+    const resp = await fetch(url);
+    if (!resp.ok) {
+      throw new Error(`CID fetch failed (status ${resp.status}) :(`);
+    }
+    const data = await resp.json();
+    const cids = data?.IdentifierList?.CID || [];
+    return cids.length ? cids[0] : null;
+  }
+
+  async function getSdsData(cid) {
+    const url = `https://pubchem.ncbi.nlm.nih.gov/rest/pug_view/data/compound/${cid}/JSON`;
+    const resp = await fetch(url);
+    if (!resp.ok) {
+      throw new Error(`PUG-View data fetch failed (status ${resp.status}) :(`);
+    }
+    const data = await resp.json();
+
+    const record = data.Record || {};
+    const sections = record.Section || [];
+
+    const result = {
+      meltingPoints: [],
+      boilingPoints: [],
+      densities: [],
+      ghs: ""
+    };
+
+    function searchSections(secs) {
+      for (let sec of secs) {
+        const heading = sec.TOCHeading || "";
+
+        if (["Melting Point", "Boiling Point", "Density"].includes(heading)) {
+          const infoList = sec.Information || [];
+          for (let info of infoList) {
+            let text = info.Value?.String || "";
+            if (info.Value?.StringWithMarkup) {
+              text = info.Value.StringWithMarkup.map(swm => swm.String).join(" ");
+            }
+            text = text.trim();
+
+            if (heading === "Melting Point" && text) {
+              result.meltingPoints.push(text);
+            }
+            if (heading === "Boiling Point" && text) {
+              result.boilingPoints.push(text);
+            }
+            if (heading === "Density" && text) {
+              result.densities.push(text);
+            }
+          }
+        }
+
+        if (heading.includes("GHS")) {
+          const infoList = sec.Information || [];
+          for (let info of infoList) {
+            let text = info.Value?.String || "";
+            if (info.Value?.StringWithMarkup) {
+              text = info.Value.StringWithMarkup.map(swm => swm.String).join(" ");
+            }
+            text = text.trim();
+            if (text) {
+              result.ghs += text + " | ";
+            }
+          }
+        }
+
+        if (sec.Section) {
+          searchSections(sec.Section);
+        }
+      }
+    }
+
+    searchSections(sections);
+
+    if (result.ghs.endsWith(" | ")) {
+      result.ghs = result.ghs.slice(0, -3);
+    }
+
+    return result;
+  }
+
+  async function getMolecularWeight(cid) {
+    const url = `https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/cid/${cid}/property/MolecularWeight/JSON`;
+    const resp = await fetch(url);
+    if (!resp.ok) {
+      return null;
+    }
+    const data = await resp.json();
+    const props = data?.PropertyTable?.Properties || [];
+    if (props.length > 0 && props[0].MolecularWeight) {
+      return props[0].MolecularWeight;
+    }
+    return null;
+  }
+
+/* render table */
+
+  function renderResultsTable(allData) {
+    let tableHtml = `
+      <table id="resultsTable">
+        <thead>
+          <tr>
+            <th>Compound</th>
+            <th>CID</th>
+            <th>Molecular Weight</th>
+            <th>Melting Point</th>
+            <th>Boiling Point</th>
+            <th>Density</th>
+            <th>GHS Classification</th>
+          </tr>
+        </thead>
+        <tbody>
+    `;
+
+    for (let item of allData) {
+      tableHtml += `
+        <tr>
+          <td>${escapeHtml(item.compoundName)}</td>
+          <td>${escapeHtml(item.cid)}</td>
+          <td>${escapeHtml(item.mw)}</td>
+          <td>${escapeHtml(item.meltingPoint)}</td>
+          <td>${escapeHtml(item.boilingPoint)}</td>
+          <td>${escapeHtml(item.density)}</td>
+          <td>${escapeHtml(item.ghs)}</td>
+        </tr>
+      `;
+    }
+
+    tableHtml += `</tbody></table>`;
+    resultsDiv.innerHTML = tableHtml;
+  }
+
+  function escapeHtml(str) {
+    if (!str) return "";
+    return str
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;");
+  }
+
+/* export the data */
+
+  downloadCsvBtn.addEventListener("click", () => {
+    downloadCsv("resultsTable");
+  });
+  downloadDocBtn.addEventListener("click", () => {
+    downloadDoc("resultsTable");
+  });
+
+/* csv */
+
+  function downloadCsv(tableId) {
+    const table = document.getElementById(tableId);
+    if (!table) return;
+
+    let csvContent = "";
+    for (let row of table.rows) {
+      const cells = [...row.cells].map(cell => {
+        return `"${cell.innerText.replace(/"/g, '""')}"`;
+      });
+      csvContent += cells.join(",") + "\n";
+    }
+
+    const blob = new Blob([csvContent], { type: "text/csv;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
+
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = "sds_data.csv";
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+  }
+
+/* word */
+
+  function downloadDoc(tableId) {
+    const table = document.getElementById(tableId);
+    if (!table) return;
+
+    const tableHtml = table.outerHTML;
+    const html = `
+      <html xmlns:o='urn:schemas-microsoft-com:office:office'
+            xmlns:w='urn:schemas-microsoft-com:office:word'
+            xmlns='http://www.w3.org/TR/REC-html40'>
+      <head><meta charset="utf-8"></head>
+      <body>
+        <h1>SDS Data Export</h1>
+        ${tableHtml}
+      </body>
+      </html>
+    `;
+    const blob = new Blob([html], { type: "application/msword" });
+    const url = URL.createObjectURL(blob);
+
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = "sds_data.doc";
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+  }
+</script>
+</body>
+</html>
